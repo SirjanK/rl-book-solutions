@@ -8,8 +8,8 @@ Special twists:
 
 Generate 5 x 5 grid of v*(s).
 
-We will solve this using value iteration. To prove to myself value iteration does converge,
-
+We will solve this using value iteration. To prove to myself value iteration does converge, I spelled it out
+in `Value_Iteration_Convergence_Proof.pdf`.
 """
 
 
