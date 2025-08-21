@@ -2,9 +2,10 @@ import numpy as np
 from typing import List, Tuple, Iterator
 from truncated_poisson import TruncatedPoisson
 import itertools
+from typing import Optional
 
 
-class CarRentalSimpleSolver:
+class CarRentalSolver:
     def __init__(self, 
                  rent_multiplier: float, 
                  move_cost: float, 
@@ -12,10 +13,13 @@ class CarRentalSimpleSolver:
                  lambda_loc2_requests: float,
                  lambda_loc1_returns: float,
                  lambda_loc2_returns: float,
-                 max_car_at_loc: float,
-                 max_car_moved: float,
+                 max_car_at_loc: int,
+                 max_car_moved: int,
                  gamma: float,
-                 tol: float) -> None:
+                 tol: float,
+                 move_benefit: bool = False,
+                 overflow_limit: Optional[int] = None,
+                 overflow_cost: Optional[float] = None) -> None:
         """
         Initialize the solver with given solve parameters.
         Policies here are 2D np arrays pi where pi[i, j] represents the action to take at state (i, j).
@@ -31,6 +35,9 @@ class CarRentalSimpleSolver:
         :param max_car_moved: max number of cars we're allowed to move in one night
         :param gamma: discount factor
         :param tol: tolerance for value functions to determine convergence
+        :param move_benefit: bool flag indicating if we get one first loc -> second loc movement for free
+        :param overflow_limit: limit for a parking lot at a given location. Any more than this is counted as an "overflow"
+        :param overflow_cost: cost incurred if we an overflow
         """
 
         self._rent_multplier = rent_multiplier
@@ -39,6 +46,10 @@ class CarRentalSimpleSolver:
         self._max_car_moved = max_car_moved
         self._gamma = gamma
         self._tol = tol
+        self._move_benefit = move_benefit
+        assert not ((overflow_limit is None) ^ (overflow_cost is None))
+        self._overflow_limit = overflow_limit
+        self._overflow_cost = overflow_cost
 
         # initialize truncated poisson instances that we use later in computation
         self._poisson_loc1_requests = TruncatedPoisson(
@@ -87,11 +98,11 @@ class CarRentalSimpleSolver:
 
         assert num_iter > 0
 
+        policies = [self._policy.copy()]  # list of policies, init with current policy
         if self.is_converged:
             print(f"Already converged, nothing left to solve")
-            return [], self._value_fn.copy()
+            return policies, self._value_fn.copy()
 
-        policies = [self._policy.copy()]  # list of policies, init with current policy
         for iter_idx in range(1, num_iter + 1):
             # 1. duplicate the prev value function 
             prev_value_fn = self._value_fn.copy()
@@ -100,19 +111,17 @@ class CarRentalSimpleSolver:
             self._policy_evaluation()
 
             # 3. run policy improvement
-            self._policy_improvement()
+            converged = self._policy_improvement()
             # append copy
             policies.append(self._policy.copy())
 
             # 4. compare two value functions - if converged, set the flag and exit
-            delta = np.max(np.abs(prev_value_fn - self._value_fn))
-            if delta < self._tol:
+            if converged or np.max(np.abs(prev_value_fn - self._value_fn)) < self._tol:
                 self._is_converged = True
                 print(f"Terminating due to convergence at {iter_idx=}")
                 break
 
-            if iter_idx % 10 == 0:
-                print(f"At iteration {iter_idx=}")
+            print(f"At iteration {iter_idx=}")
         
         print(f"Concluded at {iter_idx=}")
         return policies, self._value_fn.copy()
@@ -124,38 +133,47 @@ class CarRentalSimpleSolver:
 
         state_car1, state_car2 = state
 
-        # expected visits to locations that are successful (we actually have cars left)
-        expected_successful_visits1 = self._poisson_loc1_requests.expectation(trunc_val=state_car1)
-        expected_successful_visits2 = self._poisson_loc2_requests.expectation(trunc_val=state_car2)
+        # state after moves
+        state_after_move1, state_after_move2 = state_car1 + action, state_car2 - action
 
-        # reward accrued due to visits
-        reward_accrued_due_to_visits = self._rent_multplier * (expected_successful_visits1 + expected_successful_visits2)
-        # actual expected reward is accrued minus action penalty
-        expected_reward = reward_accrued_due_to_visits - self._move_cost * np.abs(action)
+        # compute expected successful requests
+        expected_requests1 = self._poisson_loc1_requests.expectation(trunc_val=state_after_move1)
+        expected_requests2 = self._poisson_loc2_requests.expectation(trunc_val=state_after_move2)
+        # expected reward for a single time step r(s, a)
+        moves_with_cost = abs(action)
+        # if we move from first to second and we have move benefit enabled, subtract one off
+        if action < 0 and self._move_benefit:
+            moves_with_cost -= 1
+        expected_reward = self._rent_multplier * (expected_requests1 + expected_requests2) - self._move_cost * moves_with_cost
+        # if overflow limit and cost are enabled, incur penalties
+        if self._overflow_limit is not None:
+            if state_after_move1 > self._overflow_limit:
+                expected_reward -= self._overflow_cost
+            if state_after_move2 > self._overflow_limit:
+                expected_reward -= self._overflow_cost
 
-        # iterate through the next possible states
-        # first add affects of cars moved
-        state_after_move1 = state_car1 + action
-        state_after_move2 = state_car2 - action
+        # expected next state contribution using p(s'|s, a)
+        expected_next_state_value = 0
+        for request1, request2 in itertools.product(range(state_after_move1 + 1), range(state_after_move2 + 1)):
+            # all pmfs are independent
+            pmf_requests = self._poisson_loc1_requests.pmf(trunc_val=state_after_move1, num=request1) \
+                * self._poisson_loc2_requests.pmf(trunc_val=state_after_move2, num=request2)
 
-        weighted_next_state_contributions = 0
-        # returns to each location is independent of the other
-        # they are distributed according to the truncated poisson
-        # with trunc val max_car_at_loc - state_after_move
-        max_return1 = self._max_car_at_loc - state_after_move1
-        max_return2 = self._max_car_at_loc - state_after_move2
-        for returns_loc1, returns_loc2 in itertools.product(
-            range(max_return1 + 1),
-            range(max_return2 + 1),
-        ):
-            pmf_loc1 = self._poisson_loc1_returns.pmf(trunc_val=max_return1, num=returns_loc1)
-            pmf_loc2 = self._poisson_loc2_returns.pmf(trunc_val=max_return2, num=returns_loc2)
-            # returns are independent
-            pmf = pmf_loc1 * pmf_loc2
-
-            weighted_next_state_contributions += pmf * self._value_fn[state_after_move1 + returns_loc1, state_after_move2 + returns_loc2]
+            # iterate through the return random variables
+            expected_given_requests = 0
+            max_return1 = self._max_car_at_loc - state_after_move1 + request1
+            max_return2 = self._max_car_at_loc - state_after_move2 + request2
+            for return1, return2 in itertools.product(
+                range(max_return1 + 1), range(max_return2 + 1),
+            ):
+                pmf_returns = self._poisson_loc1_returns.pmf(trunc_val=max_return1, num=return1) \
+                    * self._poisson_loc2_returns.pmf(trunc_val=max_return2, num=return2)
+                next_state1 = state_after_move1 - request1 + return1
+                next_state2 = state_after_move2 - request2 + return2
+                expected_given_requests += pmf_returns * self._value_fn[next_state1, next_state2]
+            expected_next_state_value += pmf_requests * expected_given_requests
         
-        return expected_reward + self._gamma * weighted_next_state_contributions
+        return expected_reward + self._gamma * expected_next_state_value
     
     def _policy_evaluation(self) -> None:
         """
@@ -164,6 +182,7 @@ class CarRentalSimpleSolver:
         """
 
         delta = float("inf")  # delta between value functions
+        iter_no = 0
         # iterate until convergence
         while delta >= self._tol:
             delta = 0
@@ -177,36 +196,41 @@ class CarRentalSimpleSolver:
                 self._value_fn[*state] = new_value
 
                 delta = max(delta, abs(old_value - new_value))
+            iter_no += 1
+            print(f"{iter_no=}; {delta=}")
 
-    def _policy_improvement(self) -> None:
+    def _policy_improvement(self) -> bool:
         """
         Policy improvement iterations - update policy given current value function.
         Guaranteed to terminate given this is a finite MDP.
+
+        :return: bool flag whether we've hit convergence
         """
 
         # True once we've reached a fixed point in the policy
-        stable = False
+        stable = True
+        for state in self._state_iter():
+            state_car1, state_car2 = state
+            old_action = self._policy[state_car1, state_car2]
 
-        while not stable:
-            stable = True
-            for state in self._state_iter():
-                state_car1, state_car2 = state
-                old_action = self._policy[state_car1, state_car2]
+            # get the action that yields max expected return
+            # actions are restricted to a certain range
+            max_action = old_action 
+            max_action_value = -float("inf")
+            for action in range(
+                max(-state_car1, -self._max_car_moved, state_car2 - self._max_car_at_loc), 
+                min(state_car2, self._max_car_moved, self._max_car_at_loc - state_car1) + 1):
+                expected_return = self._compute_expected_return_given_state_action(state=state, action=action)
 
-                # get the action that yields max expected return
-                # actions are restricted to a certain range
-                max_action = old_action 
-                max_action_value = -float("inf")
-                for action in range(max(-state_car1, -self._max_car_moved), min(state_car2, self._max_car_moved) + 1):
-                    expected_return = self._compute_expected_return_given_state_action(state=state, action=action)
+                if expected_return > max_action_value:
+                    max_action_value = expected_return
+                    max_action = action
+            
+            stable = stable and (max_action == old_action)
 
-                    if expected_return > max_action_value:
-                        max_action_value = expected_return
-                        max_action = action
-                
-                stable = stable and (max_action == old_action)
-
-                self._policy[state_car1, state_car2] = action
+            self._policy[state_car1, state_car2] = max_action
+        
+        return stable
     
     def _state_iter(self) -> Iterator[Tuple[int, int]]:
         """
